@@ -647,6 +647,35 @@ pub(super) fn render_clock_popover(ui: &mut egui::Ui, data: &UIData, actions: &m
         });
     }
 
+    // Detected tempos are folded by octaves into this range. Max stays at
+    // least twice min, so the engine widens a narrower range.
+    let range = data.clock_audio_tempo_range;
+    let (mut min, mut max) = (range.min, range.max);
+    let (lo, hi) = crate::audio::TempoRange::LIMITS;
+    ui.horizontal(|ui| {
+        ui.label("    Audio range")
+            .on_hover_text("Detected tempos are halved or doubled into this range");
+        let min_drag = ui.add(
+            egui::DragValue::new(&mut min)
+                .range(lo..=hi / 2.0)
+                .speed(1.0)
+                .max_decimals(0),
+        );
+        ui.label("–");
+        let max_drag = ui.add(
+            egui::DragValue::new(&mut max)
+                .range(2.0 * min..=hi)
+                .speed(1.0)
+                .max_decimals(0)
+                .suffix(" BPM"),
+        );
+        if min_drag.changed() || max_drag.changed() {
+            actions
+                .commands
+                .push(EngineCommand::SetAudioTempoRange { min, max });
+        }
+    });
+
     let is_manual = data.clock_preference == "ForceManual";
     let mut manual_bpm = data.clock_manual_bpm.unwrap_or(120.0);
     ui.horizontal(|ui| {

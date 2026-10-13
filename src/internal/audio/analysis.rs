@@ -4,6 +4,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 use cpal::Sample;
@@ -13,7 +14,7 @@ use rustfft::{Fft, FftPlanner, num_complex::Complex};
 use super::{
     AudioData, FFT_HOP, FFT_SIZE, MIN_ONSET_INTERVAL, ONSET_BAND_HZ, ONSET_MEDIAN_WINDOW,
     PcmSubscriber, SILENCE_LEVEL, SILENCE_RESET_SECS, TEMPO_CONFIRMATIONS, TEMPO_MIN_SECS,
-    TEMPO_SMOOTHING, TEMPO_TOLERANCE, TEMPO_UPDATE_SECS, TEMPO_WINDOW_SECS,
+    TEMPO_SMOOTHING, TEMPO_TOLERANCE, TEMPO_UPDATE_SECS, TEMPO_WINDOW_SECS, TempoRange,
     compute_onset_threshold, estimate_bpm, fan_out_pcm,
 };
 
@@ -23,10 +24,21 @@ const BAND_LEVEL_SECS: f32 = 1.0;
 /// Seconds from a kick's start to its detected onset, as a fraction of the
 /// frame: flux builds up as the attack moves into the Hann-windowed frame.
 const ONSET_LATENCY_FRAMES: f64 = 0.25;
-/// How far each on-beat onset pulls the beat grid toward itself.
+/// Seconds after an onset over which its strength peaks, taken as its
+/// strength when picking each beat's strongest onset. Below
+/// [`MIN_ONSET_INTERVAL`], so peaks don't overlap.
+const ONSET_PEAK_SECS: f64 = 0.05;
+/// Seconds of onsets kept for the beat grid: more than a beat and a half at
+/// the slowest tempo.
+const ONSET_HISTORY_SECS: f64 = 3.0;
+/// Distance (beats) from a predicted beat within which a beat's strongest
+/// onset counts as on the beat.
+const PHASE_LOCK_BEATS: f64 = 0.125;
+/// How far each on-beat strongest onset pulls the beat grid toward itself.
 const PHASE_CORRECTION: f64 = 0.25;
-/// Consecutive off-beat onsets after which the beat grid snaps to the latest.
-const PHASE_RELOCK_ONSETS: u32 = 4;
+/// Consecutive beats whose strongest onset is off the grid after which the
+/// grid snaps to the latest of them.
+const PHASE_RELOCK_BEATS: u32 = 4;
 
 /// Tempo with hysteresis: a tempo that disagrees with the current one, such as
 /// its double, replaces it only after [`TEMPO_CONFIRMATIONS`] agreeing
@@ -92,13 +104,20 @@ pub(crate) struct HopAnalyzer {
     hops_to_estimate: usize,
     /// Time of the latest onset, corrected for detection latency.
     last_onset: Option<f64>,
+    /// Onsets over the last [`ONSET_HISTORY_SECS`]: time and peak strength.
+    onsets: VecDeque<(f64, f32)>,
+    /// Hops left over which the latest onset's peak strength is tracked.
+    peak_hops_left: usize,
     /// Seconds of input below [`SILENCE_LEVEL`].
     quiet_secs: f32,
     tempo: TempoTracker,
+    tempo_range: TempoRange,
     /// Time of the latest beat on the tracked grid, kept within one beat of
     /// now so tempo refinements barely move the phase.
     beat_anchor: f64,
-    off_beat_onsets: u32,
+    /// The latest predicted beat whose strongest onset was checked.
+    judged_beat: f64,
+    off_beat_beats: u32,
 }
 
 impl HopAnalyzer {
@@ -129,16 +148,45 @@ impl HopAnalyzer {
             envelope_capacity,
             hops_to_estimate: 0,
             last_onset: None,
+            onsets: VecDeque::new(),
+            peak_hops_left: 0,
             quiet_secs: 0.0,
             tempo: TempoTracker::default(),
+            tempo_range: TempoRange::default(),
             beat_anchor: 0.0,
-            off_beat_onsets: 0,
+            judged_beat: f64::NEG_INFINITY,
+            off_beat_beats: 0,
+        }
+    }
+
+    /// Sets the range tempos are folded into. A different range restarts tempo
+    /// tracking, so the next estimate lands in it.
+    pub(crate) fn set_tempo_range(&mut self, range: TempoRange) {
+        let range = TempoRange::new(range.min, range.max);
+        if range != self.tempo_range {
+            self.tempo_range = range;
+            self.tempo = TempoTracker::default();
+            self.hops_to_estimate = 0;
         }
     }
 
     /// Hops per second.
     fn hop_rate(&self) -> f32 {
         self.sample_rate / FFT_HOP as f32
+    }
+
+    /// Seconds from a kick's start to its detected onset.
+    fn onset_latency(&self) -> f64 {
+        ONSET_LATENCY_FRAMES * FFT_SIZE as f64 / f64::from(self.sample_rate)
+    }
+
+    /// Time of the strongest onset in `from..to`.
+    fn strongest_onset(&self, from: f64, to: f64) -> Option<f64> {
+        self.onsets
+            .iter()
+            .filter(|(t, _)| (from..to).contains(t))
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|&(t, _)| t)
     }
 
     /// Analyzes one hop of `FFT_HOP` mono samples.
@@ -196,14 +244,28 @@ impl HopAnalyzer {
         if self.flux_history.len() > ONSET_MEDIAN_WINDOW {
             self.flux_history.remove(0);
         }
-        let onset_time = now - ONSET_LATENCY_FRAMES * FFT_SIZE as f64 / f64::from(self.sample_rate);
+        let onset_time = now - self.onset_latency();
         let onset = (strength > compute_onset_threshold(&self.flux_history)
             && self
                 .last_onset
                 .is_none_or(|t| onset_time - t > f64::from(MIN_ONSET_INTERVAL)))
         .then_some(onset_time);
-        if onset.is_some() {
+        if let Some(t) = onset {
             self.last_onset = onset;
+            self.onsets.push_back((t, strength));
+            self.peak_hops_left = (ONSET_PEAK_SECS * f64::from(self.hop_rate())) as usize;
+        } else if self.peak_hops_left > 0 {
+            self.peak_hops_left -= 1;
+            if let Some((_, peak)) = self.onsets.back_mut() {
+                *peak = peak.max(strength);
+            }
+        }
+        while self
+            .onsets
+            .front()
+            .is_some_and(|(t, _)| now - t > ONSET_HISTORY_SECS)
+        {
+            self.onsets.pop_front();
         }
 
         self.envelope.push_back(strength);
@@ -226,8 +288,8 @@ impl HopAnalyzer {
             self.hops_to_estimate = 0;
         }
 
-        self.update_tempo();
-        self.update_phase(onset, now);
+        self.update_tempo(now);
+        self.update_phase(now);
 
         let time_since_beat = match self.tempo.bpm {
             Some(_) => now - self.beat_anchor,
@@ -244,9 +306,9 @@ impl HopAnalyzer {
     }
 
     /// Estimates the tempo every [`TEMPO_UPDATE_SECS`] once the envelope holds
-    /// [`TEMPO_MIN_SECS`]. A replaced tempo puts the beat grid on the latest
-    /// onset.
-    fn update_tempo(&mut self) {
+    /// [`TEMPO_MIN_SECS`]. A replaced tempo puts the beat grid on the strongest
+    /// onset of the last beat.
+    fn update_tempo(&mut self, now: f64) {
         if self.hops_to_estimate > 0 {
             self.hops_to_estimate -= 1;
             return;
@@ -256,34 +318,50 @@ impl HopAnalyzer {
             return;
         }
         self.hops_to_estimate = (TEMPO_UPDATE_SECS * hop_rate) as usize;
-        if let Some(estimate) = estimate_bpm(self.envelope.make_contiguous(), hop_rate)
+        if let Some(estimate) =
+            estimate_bpm(self.envelope.make_contiguous(), hop_rate, self.tempo_range)
             && self.tempo.update(estimate)
-            && let Some(onset) = self.last_onset
+            && let Some(bpm) = self.tempo.bpm
+            && let Some(onset) = self
+                .strongest_onset(now - 60.0 / f64::from(bpm), now)
+                .or(self.last_onset)
         {
             self.beat_anchor = onset;
-            self.off_beat_onsets = 0;
+            self.judged_beat = onset;
+            self.off_beat_beats = 0;
         }
     }
 
-    /// Beat grid as a simple PLL: an onset near a predicted beat pulls the grid
-    /// toward it, off-beat onsets are ignored unless they keep coming, in which
-    /// case the grid snaps to them.
-    fn update_phase(&mut self, onset: Option<f64>, now: f64) {
+    /// Beat grid as a simple PLL on each beat's strongest onset, so a rolling
+    /// bassline's notes between kicks don't move it. Once a beat's window,
+    /// half a beat either side, has passed, its strongest onset pulls the grid
+    /// toward itself if near the beat. Off the beat it is ignored unless that
+    /// keeps happening, in which case the grid snaps to it.
+    fn update_phase(&mut self, now: f64) {
         let Some(bpm) = self.tempo.bpm else {
             return;
         };
         let period = 60.0 / f64::from(bpm);
-        if let Some(onset) = onset {
-            // Distance from the nearest predicted beat, in beats.
-            let error = ((onset - self.beat_anchor) / period + 0.5).rem_euclid(1.0) - 0.5;
-            if error.abs() < 0.25 {
-                self.beat_anchor += error * period * PHASE_CORRECTION;
-                self.off_beat_onsets = 0;
-            } else {
-                self.off_beat_onsets += 1;
-                if self.off_beat_onsets >= PHASE_RELOCK_ONSETS {
-                    self.beat_anchor = onset;
-                    self.off_beat_onsets = 0;
+        // Onsets up to here have their peak strength.
+        let settled = now - self.onset_latency() - ONSET_PEAK_SECS;
+        // The latest predicted beat whose window has settled.
+        let beat = self.beat_anchor
+            + ((settled - 0.5 * period - self.beat_anchor) / period).floor() * period;
+        if beat > self.judged_beat + 0.5 * period {
+            self.judged_beat = beat;
+            if let Some(onset) = self.strongest_onset(beat - 0.5 * period, beat + 0.5 * period) {
+                // Distance from the predicted beat, in beats.
+                let error = (onset - beat) / period;
+                if error.abs() < PHASE_LOCK_BEATS {
+                    self.beat_anchor += error * period * PHASE_CORRECTION;
+                    self.off_beat_beats = 0;
+                } else {
+                    self.off_beat_beats += 1;
+                    if self.off_beat_beats >= PHASE_RELOCK_BEATS {
+                        self.beat_anchor = onset;
+                        self.judged_beat = onset;
+                        self.off_beat_beats = 0;
+                    }
                 }
             }
         }
@@ -308,8 +386,9 @@ pub(crate) struct CaptureState {
 }
 
 impl CaptureState {
-    /// Starts the analysis thread, which publishes to `sender` and exits when
-    /// this is dropped with the stream.
+    /// Starts the analysis thread, which publishes to `sender`, folds tempos
+    /// into the [`TempoRange`] packed in `tempo_range`, and exits when this is
+    /// dropped with the stream.
     ///
     /// # Errors
     ///
@@ -319,6 +398,7 @@ impl CaptureState {
         sample_rate: f32,
         sender: Sender<AudioData>,
         pcm_subs: Arc<ArcSwap<Vec<PcmSubscriber>>>,
+        tempo_range: Arc<AtomicU64>,
     ) -> std::io::Result<Self> {
         let (hops, received) = crossbeam_channel::bounded::<[f32; FFT_HOP]>(HOP_QUEUE);
         std::thread::Builder::new()
@@ -326,6 +406,9 @@ impl CaptureState {
             .spawn(move || {
                 let mut analyzer = HopAnalyzer::new(sample_rate);
                 while let Ok(hop) = received.recv() {
+                    analyzer.set_tempo_range(TempoRange::from_bits(
+                        tempo_range.load(Ordering::Relaxed),
+                    ));
                     let _ = sender.try_send(analyzer.analyze(&hop));
                 }
             })?;
@@ -374,9 +457,11 @@ impl CaptureState {
 
 #[cfg(test)]
 mod tests {
-    use super::{CaptureState, FFT_HOP, HopAnalyzer, TempoTracker};
+    use super::{CaptureState, FFT_HOP, HopAnalyzer, TempoRange, TempoTracker};
     use crate::audio::AudioData;
     use std::f32::consts::TAU;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
 
     const RATE: f32 = 48_000.0;
 
@@ -427,6 +512,33 @@ mod tests {
             *v += 0.35 * (-t / 0.06).exp() * noise.next()
                 + 0.4 * (-t / 0.08).exp() * (TAU * 190.0 * t).sin();
         }
+    }
+
+    /// Bass note: a 55 Hz sine with a fast attack and a short decay, as in a
+    /// rolling psytrance bassline. Softer than the kick.
+    fn bass(out: &mut [f32]) {
+        for (i, v) in out.iter_mut().take((0.15 * RATE) as usize).enumerate() {
+            let t = i as f32 / RATE;
+            let attack = (t / 0.002).min(1.0);
+            *v += 0.4 * attack * (-t / 0.04).exp() * (TAU * 55.0 * t).sin();
+        }
+    }
+
+    /// `secs` of a kick on each beat and a bass note on each of the three
+    /// other 16ths, at `bpm`.
+    fn rolling_bass(bpm: f32, secs: f32) -> Vec<f32> {
+        let beat = 60.0 / bpm;
+        let mut out = vec![0.0; (secs * RATE) as usize];
+        let end = out.len();
+        let start = |t: f32| ((t * RATE) as usize).min(end);
+        for b in 0..(secs / beat).ceil() as usize {
+            let t = b as f32 * beat;
+            kick(&mut out[start(t)..end]);
+            for sixteenth in 1..4 {
+                bass(&mut out[start(t + beat * sixteenth as f32 / 4.0)..end]);
+            }
+        }
+        out
     }
 
     /// `secs` of a four-on-the-floor kick at `bpm`, with optional snare on
@@ -558,30 +670,79 @@ mod tests {
         );
     }
 
+    /// From 10 s on, the beat phase is near 0 when each kick of `signal`, a
+    /// kick on every beat at `bpm`, starts.
+    fn assert_phase_zero_on_kicks(case: &str, bpm: f32, signal: &[f32]) {
+        let beat = 60.0 / bpm;
+        let mut kicks = 0;
+        run(signal, |i, data, _| {
+            // Phase at the end of the hop holding a kick's first sample.
+            let start = i as f32 * hop_secs();
+            let end = start + hop_secs();
+            let kick = (end / beat).floor() * beat;
+            if start < 10.0 || kick < start {
+                return;
+            }
+            let phase = data.beat_phase() - (end - kick) / beat;
+            let error = (phase + 0.5).rem_euclid(1.0) - 0.5;
+            assert!(
+                error.abs() < 0.06,
+                "{case}: phase off by {error:.3} at {start:.2} s"
+            );
+            kicks += 1;
+        });
+        assert!(kicks >= 8, "{case}: only {kicks} kicks checked");
+    }
+
     /// On a kick alone, the beat phase is near 0 when each kick starts.
     #[test]
     fn beat_phase_is_zero_on_kicks() {
         for bpm in [100.0, 128.0, 140.0] {
-            let beat = 60.0 / bpm;
-            let mut kicks = 0;
-            run(&pattern(bpm, 16.0, false, Hats::None, 0.0), |i, data, _| {
-                // Phase at the end of the hop holding a kick's first sample.
-                let start = i as f32 * hop_secs();
-                let end = start + hop_secs();
-                let kick = (end / beat).floor() * beat;
-                if start < 10.0 || kick < start {
-                    return;
-                }
-                let phase = data.beat_phase() - (end - kick) / beat;
-                let error = (phase + 0.5).rem_euclid(1.0) - 0.5;
-                assert!(
-                    error.abs() < 0.06,
-                    "{bpm} BPM: phase off by {error:.3} at {start:.2} s"
-                );
-                kicks += 1;
-            });
-            assert!(kicks >= 8, "{bpm} BPM: only {kicks} kicks checked");
+            let signal = pattern(bpm, 16.0, false, Hats::None, 0.0);
+            assert_phase_zero_on_kicks(&format!("{bpm} BPM"), bpm, &signal);
         }
+    }
+
+    /// With a rolling bassline in the kick band, the BPM is the kick's, not a
+    /// 16th's, from fast psytrance to hitech, and the beat grid stays on the
+    /// kick rather than a bass note.
+    #[test]
+    fn kick_and_rolling_bass() {
+        for bpm in [145.0, 190.0, 210.0] {
+            let signal = rolling_bass(bpm, 16.0);
+            let case = format!("{bpm} BPM rolling bass");
+            for (i, got) in bpm_track(&signal).iter().enumerate() {
+                let t = i as f32 * hop_secs();
+                if t >= 10.0 {
+                    let got = got.unwrap_or_else(|| panic!("{case}: no BPM at {t:.2} s"));
+                    assert!((got - bpm).abs() <= 2.0, "{case}: {got} at {t:.2} s");
+                }
+            }
+            assert_phase_zero_on_kicks(&case, bpm, &signal);
+        }
+    }
+
+    /// A tempo above the range is folded into it, and setting the range again
+    /// unfolds it.
+    #[test]
+    fn tempo_range_folds_the_bpm() {
+        let signal = pattern(200.0, 16.0, false, Hats::None, 0.0);
+        let mut analyzer = HopAnalyzer::new(RATE);
+        analyzer.set_tempo_range(TempoRange::new(70.0, 180.0));
+        let hops = signal.as_chunks::<FFT_HOP>().0;
+        let (first, second) = hops.split_at(hops.len() / 2);
+        let mut bpm = None;
+        for hop in first {
+            bpm = analyzer.analyze(hop).bpm;
+        }
+        let folded = bpm.expect("BPM in the narrow range");
+        assert!((folded - 100.0).abs() <= 2.0, "folded to {folded}");
+        analyzer.set_tempo_range(TempoRange::default());
+        for hop in second {
+            bpm = analyzer.analyze(hop).bpm;
+        }
+        let unfolded = bpm.expect("BPM in the default range");
+        assert!((unfolded - 200.0).abs() <= 2.0, "unfolded to {unfolded}");
     }
 
     /// A single estimate at the double tempo doesn't replace the tempo; three
@@ -627,7 +788,8 @@ mod tests {
             .collect();
 
         let (sender, published) = crossbeam_channel::bounded(HOPS);
-        let mut capture = CaptureState::new(2, 48_000.0, sender, std::sync::Arc::default())
+        let tempo_range = Arc::new(AtomicU64::new(TempoRange::default().to_bits()));
+        let mut capture = CaptureState::new(2, 48_000.0, sender, Arc::default(), tempo_range)
             .expect("analysis thread");
         for buffer in signal.chunks(2 * 100) {
             capture.process(buffer);

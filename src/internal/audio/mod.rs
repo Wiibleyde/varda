@@ -113,10 +113,9 @@ const TEMPO_WINDOW_SECS: f32 = 8.0;
 const TEMPO_MIN_SECS: f32 = 4.0;
 /// Seconds between tempo estimates.
 const TEMPO_UPDATE_SECS: f32 = 0.5;
-/// Tempo range (BPM) searched for the beat period, before folding.
-const TEMPO_SEARCH_BPM: (f32, f32) = (40.0, 240.0);
-/// Musical tempo range (BPM) that estimates are folded into by octaves.
-const TEMPO_FOLD_BPM: (f32, f32) = (70.0, 180.0);
+/// Tempo range (BPM) searched for the beat period, before folding into the
+/// user's [`TempoRange`].
+const TEMPO_SEARCH_BPM: (f32, f32) = (40.0, 320.0);
 /// Multiples of a candidate period the comb sums over the autocorrelation.
 const TEMPO_COMB_HARMONICS: usize = 4;
 /// Minimum comb score, relative to a perfectly periodic envelope, for an
@@ -128,6 +127,63 @@ const TEMPO_TOLERANCE: f32 = 0.04;
 const TEMPO_CONFIRMATIONS: u32 = 3;
 /// How far each agreeing estimate moves the current tempo toward it.
 const TEMPO_SMOOTHING: f32 = 0.3;
+
+/// Tempo range (BPM) that detected tempos are folded into by octaves, set from
+/// the clock popover. `max` is at least twice `min`, so every tempo has an
+/// octave inside it.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct TempoRange {
+    pub min: f32,
+    pub max: f32,
+}
+
+impl Default for TempoRange {
+    fn default() -> Self {
+        Self {
+            min: 70.0,
+            max: 240.0,
+        }
+    }
+}
+
+impl TempoRange {
+    /// Bounds either end can take: the tempos the estimator searches.
+    pub const LIMITS: (f32, f32) = TEMPO_SEARCH_BPM;
+
+    /// A range within [`Self::LIMITS`], widened to an octave by moving `max`
+    /// up. Non-finite ends fall back to the default.
+    pub fn new(min: f32, max: f32) -> Self {
+        let default = Self::default();
+        let min = if min.is_finite() { min } else { default.min };
+        let max = if max.is_finite() { max } else { default.max };
+        let min = min.clamp(Self::LIMITS.0, Self::LIMITS.1 / 2.0);
+        let max = max.clamp(2.0 * min, Self::LIMITS.1);
+        Self { min, max }
+    }
+
+    /// Doubles or halves a positive `bpm` into the range.
+    fn fold(self, mut bpm: f32) -> f32 {
+        while bpm < self.min {
+            bpm *= 2.0;
+        }
+        while bpm > self.max {
+            bpm /= 2.0;
+        }
+        bpm
+    }
+
+    /// Both ends packed into one word, for the analysis threads.
+    pub(crate) fn to_bits(self) -> u64 {
+        (u64::from(self.min.to_bits()) << 32) | u64::from(self.max.to_bits())
+    }
+
+    pub(crate) fn from_bits(bits: u64) -> Self {
+        Self {
+            min: f32::from_bits((bits >> 32) as u32),
+            max: f32::from_bits(bits as u32),
+        }
+    }
+}
 
 /// A detected audio input device.
 #[derive(Debug, Clone)]
@@ -260,12 +316,14 @@ pub fn compute_onset_threshold(flux_history: &[f32]) -> f32 {
 /// Estimates BPM from an onset strength envelope sampled at `hop_rate` Hz.
 ///
 /// Scores each candidate period in [`TEMPO_SEARCH_BPM`] by summing the
-/// envelope's autocorrelation at its first [`TEMPO_COMB_HARMONICS`] multiples.
-/// Missing or stray onsets only lower some terms, the true period beats its
-/// double (fewer multiples fit the window) and its half (every other multiple
-/// misses). The best candidate is folded by octaves into [`TEMPO_FOLD_BPM`].
+/// envelope's autocorrelation at its first [`TEMPO_COMB_HARMONICS`] multiples,
+/// minus the autocorrelation halfway between them. Missing or stray onsets only
+/// lower some terms. The double period scores near zero (its halfway points
+/// are true beats too), and the half period loses to the true one as long as
+/// the beat is stronger than what falls between beats, such as a rolling
+/// bassline's notes. The best candidate is folded by octaves into `range`.
 /// `None` without a clear periodicity. Non-finite values count as zero.
-pub fn estimate_bpm(envelope: &[f32], hop_rate: f32) -> Option<f32> {
+pub fn estimate_bpm(envelope: &[f32], hop_rate: f32, range: TempoRange) -> Option<f32> {
     const STEP_BPM: f32 = 0.5;
     let n = envelope.len();
     if n < 2 || !(hop_rate.is_finite() && hop_rate > 0.0) {
@@ -278,13 +336,16 @@ pub fn estimate_bpm(envelope: &[f32], hop_rate: f32) -> Option<f32> {
     let period = |bpm: f32| hop_rate * 60.0 / bpm;
     let max_lag =
         ((TEMPO_COMB_HARMONICS as f32 * period(TEMPO_SEARCH_BPM.0)).ceil() as usize + 1).min(n - 1);
+    // Mean product per lag, so long lags, which overlap fewer values, weigh
+    // the same as short ones.
     let acf: Vec<f32> = (0..=max_lag)
         .map(|lag| {
             centered[..n - lag]
                 .iter()
                 .zip(&centered[lag..])
                 .map(|(a, b)| a * b)
-                .sum()
+                .sum::<f32>()
+                / (n - lag) as f32
         })
         .collect();
     if !(acf[0].is_finite() && acf[0] > 0.0) {
@@ -299,21 +360,26 @@ pub fn estimate_bpm(envelope: &[f32], hop_rate: f32) -> Option<f32> {
         let t = lag - i as f32;
         acf[i] * (1.0 - t) + acf[i + 1] * t
     };
-    let comb = |bpm: f32| {
+    // Sum at multiples of the period, offset by `shift` periods.
+    let comb = |bpm: f32, shift: f32| {
+        let p = period(bpm);
         (1..=TEMPO_COMB_HARMONICS)
-            .map(|k| acf_at(k as f32 * period(bpm)))
+            .map(|k| acf_at((k as f32 - shift) * p))
             .sum::<f32>()
     };
+    let candidate = |i: usize| TEMPO_SEARCH_BPM.0 + i as f32 * STEP_BPM;
 
     let steps = ((TEMPO_SEARCH_BPM.1 - TEMPO_SEARCH_BPM.0) / STEP_BPM) as usize;
     let scores: Vec<f32> = (0..=steps)
-        .map(|i| comb(TEMPO_SEARCH_BPM.0 + i as f32 * STEP_BPM))
+        .map(|i| comb(candidate(i), 0.0) - comb(candidate(i), 0.5))
         .collect();
     let (best, &score) = scores
         .iter()
         .enumerate()
         .max_by(|a, b| cmp_finite(*a.1, *b.1))?;
-    if score / (TEMPO_COMB_HARMONICS as f32 * acf[0]) < TEMPO_MIN_CONFIDENCE {
+    // Confidence from the periodicity alone: what falls between beats, like
+    // a rolling bassline, doesn't make the beat less clear.
+    if comb(candidate(best), 0.0) / (TEMPO_COMB_HARMONICS as f32 * acf[0]) < TEMPO_MIN_CONFIDENCE {
         return None;
     }
     // Parabolic refinement between grid steps.
@@ -328,20 +394,7 @@ pub fn estimate_bpm(envelope: &[f32], hop_rate: f32) -> Option<f32> {
     } else {
         0.0
     };
-    Some(fold_tempo(
-        TEMPO_SEARCH_BPM.0 + (best as f32 + offset) * STEP_BPM,
-    ))
-}
-
-/// Doubles or halves a positive `bpm` into [`TEMPO_FOLD_BPM`].
-fn fold_tempo(mut bpm: f32) -> f32 {
-    while bpm < TEMPO_FOLD_BPM.0 {
-        bpm *= 2.0;
-    }
-    while bpm > TEMPO_FOLD_BPM.1 {
-        bpm /= 2.0;
-    }
-    bpm
+    Some(range.fold(candidate(best) + offset * STEP_BPM))
 }
 
 /// An open audio source and its capture stream.
@@ -377,6 +430,8 @@ pub struct AudioManager {
     manual_pins: HashSet<AudioSourceId>,
     /// Devices referenced by `AudioBand` modulators, as last reconciled.
     mod_refs: HashSet<AudioSourceId>,
+    /// [`TempoRange`] bits, read by every source's analysis thread.
+    tempo_range: Arc<AtomicU64>,
 }
 
 impl Default for AudioManager {
@@ -393,6 +448,7 @@ impl AudioManager {
             default_source_id: None,
             manual_pins: HashSet::new(),
             mod_refs: HashSet::new(),
+            tempo_range: Arc::new(AtomicU64::new(TempoRange::default().to_bits())),
         };
         // Enumerate and cache the default input, but open nothing: capture
         // starts when a holder appears.
@@ -446,6 +502,18 @@ impl AudioManager {
         for dev in &self.devices {
             log::info!("  Audio {}: {}", dev.id, dev.name);
         }
+    }
+
+    /// Tempo range detected tempos are folded into.
+    pub fn tempo_range(&self) -> TempoRange {
+        TempoRange::from_bits(self.tempo_range.load(Ordering::Relaxed))
+    }
+
+    /// Sets the tempo range for every source, open now or later. Tempo
+    /// tracking restarts in the new range.
+    pub fn set_tempo_range(&mut self, range: TempoRange) {
+        let range = TempoRange::new(range.min, range.max);
+        self.tempo_range.store(range.to_bits(), Ordering::Relaxed);
     }
 
     pub fn devices(&self) -> &[AudioDeviceInfo] {
@@ -508,6 +576,7 @@ impl AudioManager {
                 sender,
                 sample_rate,
                 pcm_subs.clone(),
+                self.tempo_range.clone(),
             )?,
             cpal::SampleFormat::I16 => Self::build_stream::<i16>(
                 &device,
@@ -515,6 +584,7 @@ impl AudioManager {
                 sender,
                 sample_rate,
                 pcm_subs.clone(),
+                self.tempo_range.clone(),
             )?,
             cpal::SampleFormat::U16 => Self::build_stream::<u16>(
                 &device,
@@ -522,6 +592,7 @@ impl AudioManager {
                 sender,
                 sample_rate,
                 pcm_subs.clone(),
+                self.tempo_range.clone(),
             )?,
             _ => anyhow::bail!("Unsupported sample format"),
         };
@@ -711,14 +782,20 @@ impl AudioManager {
         sender: Sender<AudioData>,
         sample_rate: f32,
         pcm_subs: Arc<ArcSwap<Vec<PcmSubscriber>>>,
+        tempo_range: Arc<AtomicU64>,
     ) -> Result<cpal::Stream>
     where
         T: cpal::Sample + cpal::SizedSample,
         f32: cpal::FromSample<T>,
     {
-        let mut capture =
-            analysis::CaptureState::new(config.channels as usize, sample_rate, sender, pcm_subs)
-                .context("Failed to start audio analysis")?;
+        let mut capture = analysis::CaptureState::new(
+            config.channels as usize,
+            sample_rate,
+            sender,
+            pcm_subs,
+            tempo_range,
+        )
+        .context("Failed to start audio analysis")?;
         let stream = device.build_input_stream(
             config,
             move |data: &[T], _: &cpal::InputCallbackInfo| capture.process(data),
@@ -950,17 +1027,18 @@ mod tests {
         let mut env = pulse_envelope(beat_times(120.0).map(|t| (t, 1.0)));
         env[3] = f32::NAN;
         env[40] = f32::NEG_INFINITY;
-        let bpm = estimate_bpm(&env, HOP_RATE).expect("still periodic");
+        let range = TempoRange::default();
+        let bpm = estimate_bpm(&env, HOP_RATE, range).expect("still periodic");
         assert!((bpm - 120.0).abs() < 1.0, "got {bpm}");
-        assert_eq!(estimate_bpm(&[f32::NAN; 64], HOP_RATE), None);
-        assert_eq!(estimate_bpm(&env, f32::NAN), None);
+        assert_eq!(estimate_bpm(&[f32::NAN; 64], HOP_RATE, range), None);
+        assert_eq!(estimate_bpm(&env, f32::NAN, range), None);
     }
 
     #[test]
     fn bpm_estimate_steady_beats() {
-        for truth in [75.0, 100.0, 128.0, 140.0, 174.0] {
+        for truth in [75.0, 100.0, 128.0, 140.0, 174.0, 200.0, 230.0] {
             let env = pulse_envelope(beat_times(truth).map(|t| (t, 1.0)));
-            let bpm = estimate_bpm(&env, HOP_RATE).expect("periodic");
+            let bpm = estimate_bpm(&env, HOP_RATE, TempoRange::default()).expect("periodic");
             assert!((bpm - truth).abs() < 1.0, "{truth} BPM: got {bpm}");
         }
     }
@@ -978,27 +1056,81 @@ mod tests {
             .step_by(3)
             .map(|t| (t + 30.0 / truth, 0.4));
         let env = pulse_envelope(beats.chain(strays));
-        let bpm = estimate_bpm(&env, HOP_RATE).expect("periodic");
+        let bpm = estimate_bpm(&env, HOP_RATE, TempoRange::default()).expect("periodic");
         assert!((bpm - truth).abs() < 1.0, "got {bpm}");
     }
 
-    /// A period outside the musical range folds into it by octaves.
+    /// A kick with three softer bass notes per beat, on the other 16ths, gives
+    /// the kick's tempo, not its double.
     #[test]
-    fn bpm_estimate_folds_into_musical_range() {
-        // Beats at 50 BPM report 100; at 220 BPM, 110.
-        for (beats, want) in [(50.0, 100.0), (220.0, 110.0)] {
+    fn bpm_estimate_kick_and_rolling_bass() {
+        for truth in [145.0, 190.0, 210.0] {
+            let kicks = beat_times(truth).map(|t| (t, 1.0));
+            let bass = beat_times(truth)
+                .flat_map(|t| (1..4).map(move |i| (t + i as f32 * 15.0 / truth, 0.5)));
+            let env = pulse_envelope(kicks.chain(bass));
+            let bpm = estimate_bpm(&env, HOP_RATE, TempoRange::default()).expect("periodic");
+            assert!((bpm - truth).abs() < 1.0, "{truth} BPM: got {bpm}");
+        }
+    }
+
+    /// A period outside the range folds into it by octaves.
+    #[test]
+    fn bpm_estimate_folds_into_range() {
+        // Beats at 50 BPM report 100. At 220 BPM, 220 by default and 110 in
+        // 70-180.
+        for (beats, range, want) in [
+            (50.0, TempoRange::default(), 100.0),
+            (220.0, TempoRange::default(), 220.0),
+            (220.0, TempoRange::new(70.0, 180.0), 110.0),
+        ] {
             let env = pulse_envelope(beat_times(beats).map(|t| (t, 1.0)));
-            let bpm = estimate_bpm(&env, HOP_RATE).expect("periodic");
+            let bpm = estimate_bpm(&env, HOP_RATE, range).expect("periodic");
             assert!((bpm - want).abs() < 1.0, "{beats} BPM beats: got {bpm}");
         }
-        assert!((fold_tempo(256.0) - 128.0).abs() < 1e-3);
-        assert!((fold_tempo(30.0) - 120.0).abs() < 1e-3);
-        assert!((fold_tempo(140.0) - 140.0).abs() < 1e-3);
+        let range = TempoRange::default();
+        assert!((range.fold(512.0) - 128.0).abs() < 1e-3);
+        assert!((range.fold(30.0) - 120.0).abs() < 1e-3);
+        assert!((range.fold(200.0) - 200.0).abs() < 1e-3);
+    }
+
+    /// A range spans at least an octave within the limits, so folding always
+    /// ends, and survives packing for the analysis threads.
+    #[test]
+    fn tempo_range_spans_an_octave() {
+        assert_eq!(
+            TempoRange::new(150.0, 200.0),
+            TempoRange {
+                min: 150.0,
+                max: 300.0
+            }
+        );
+        assert_eq!(
+            TempoRange::new(10.0, 1000.0),
+            TempoRange {
+                min: 40.0,
+                max: 320.0
+            }
+        );
+        assert_eq!(
+            TempoRange::new(300.0, 0.0),
+            TempoRange {
+                min: 160.0,
+                max: 320.0
+            }
+        );
+        assert_eq!(
+            TempoRange::new(f32::NAN, f32::INFINITY),
+            TempoRange::default()
+        );
+        let range = TempoRange::new(87.5, 210.0);
+        assert_eq!(TempoRange::from_bits(range.to_bits()), range);
     }
 
     #[test]
     fn bpm_estimate_none_without_periodicity() {
-        assert_eq!(estimate_bpm(&vec![0.0; 1500], HOP_RATE), None);
+        let range = TempoRange::default();
+        assert_eq!(estimate_bpm(&vec![0.0; 1500], HOP_RATE, range), None);
         // Deterministic noise.
         let mut x = 0x2545_f491_u32;
         let noise: Vec<f32> = (0..1500)
@@ -1009,7 +1141,7 @@ mod tests {
                 (x >> 8) as f32 / (1 << 24) as f32
             })
             .collect();
-        assert_eq!(estimate_bpm(&noise, HOP_RATE), None);
+        assert_eq!(estimate_bpm(&noise, HOP_RATE, range), None);
     }
 
     #[test]

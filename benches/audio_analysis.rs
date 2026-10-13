@@ -10,7 +10,7 @@
 ///   `audio_hop_analysis` — one 256-sample hop of FFT, flux, onset and BPM
 ///                          analysis.
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use varda::audio::{compute_onset_threshold, estimate_bpm};
+use varda::audio::{TempoRange, compute_onset_threshold, estimate_bpm};
 use varda::testing::{AudioCaptureBench, HopAnalysisBench};
 
 /// Realistic spectral flux values (positive, varying magnitude)
@@ -54,7 +54,7 @@ fn bench_bpm_estimation(c: &mut Criterion) {
         g.bench_with_input(
             BenchmarkId::new("acf_comb", secs),
             &envelope,
-            |b, envelope| b.iter(|| estimate_bpm(envelope, HOP_RATE)),
+            |b, envelope| b.iter(|| estimate_bpm(envelope, HOP_RATE, TempoRange::default())),
         );
     }
     g.finish();
