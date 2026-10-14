@@ -95,7 +95,7 @@ const FFT_HOP: usize = AUDIO_BUFFER_SIZE;
 const ONSET_BAND_HZ: (f32, f32) = (30.0, 150.0);
 /// Minimum seconds between onsets, so one kick's attack, spread over several
 /// hops by the 2048-sample frame, fires once.
-const MIN_ONSET_INTERVAL: f32 = 0.1;
+const MIN_ONSET_INTERVAL: f32 = 0.05;
 /// Window for the adaptive onset threshold (median of recent onset strength).
 const ONSET_MEDIAN_WINDOW: usize = 8;
 /// Onset fires when onset strength exceeds median * this + offset.
@@ -316,12 +316,10 @@ pub fn compute_onset_threshold(flux_history: &[f32]) -> f32 {
 /// Estimates BPM from an onset strength envelope sampled at `hop_rate` Hz.
 ///
 /// Scores each candidate period in [`TEMPO_SEARCH_BPM`] by summing the
-/// envelope's autocorrelation at its first [`TEMPO_COMB_HARMONICS`] multiples,
-/// minus the autocorrelation halfway between them. Missing or stray onsets only
-/// lower some terms. The double period scores near zero (its halfway points
-/// are true beats too), and the half period loses to the true one as long as
-/// the beat is stronger than what falls between beats, such as a rolling
-/// bassline's notes. The best candidate is folded by octaves into `range`.
+/// envelope's autocorrelation at its first [`TEMPO_COMB_HARMONICS`] multiples.
+/// Missing or stray onsets only lower some terms, the true period beats its
+/// double (fewer multiples fit the window) and its half (every other multiple
+/// misses). The best candidate is folded by octaves into `range`.
 /// `None` without a clear periodicity. Non-finite values count as zero.
 pub fn estimate_bpm(envelope: &[f32], hop_rate: f32, range: TempoRange) -> Option<f32> {
     const STEP_BPM: f32 = 0.5;
@@ -336,8 +334,6 @@ pub fn estimate_bpm(envelope: &[f32], hop_rate: f32, range: TempoRange) -> Optio
     let period = |bpm: f32| hop_rate * 60.0 / bpm;
     let max_lag =
         ((TEMPO_COMB_HARMONICS as f32 * period(TEMPO_SEARCH_BPM.0)).ceil() as usize + 1).min(n - 1);
-    // Mean product per lag, so long lags, which overlap fewer values, weigh
-    // the same as short ones.
     let acf: Vec<f32> = (0..=max_lag)
         .map(|lag| {
             centered[..n - lag]
@@ -345,7 +341,6 @@ pub fn estimate_bpm(envelope: &[f32], hop_rate: f32, range: TempoRange) -> Optio
                 .zip(&centered[lag..])
                 .map(|(a, b)| a * b)
                 .sum::<f32>()
-                / (n - lag) as f32
         })
         .collect();
     if !(acf[0].is_finite() && acf[0] > 0.0) {
@@ -360,26 +355,20 @@ pub fn estimate_bpm(envelope: &[f32], hop_rate: f32, range: TempoRange) -> Optio
         let t = lag - i as f32;
         acf[i] * (1.0 - t) + acf[i + 1] * t
     };
-    // Sum at multiples of the period, offset by `shift` periods.
-    let comb = |bpm: f32, shift: f32| {
-        let p = period(bpm);
+    let comb = |bpm: f32| {
         (1..=TEMPO_COMB_HARMONICS)
-            .map(|k| acf_at((k as f32 - shift) * p))
+            .map(|k| acf_at(k as f32 * period(bpm)))
             .sum::<f32>()
     };
     let candidate = |i: usize| TEMPO_SEARCH_BPM.0 + i as f32 * STEP_BPM;
 
     let steps = ((TEMPO_SEARCH_BPM.1 - TEMPO_SEARCH_BPM.0) / STEP_BPM) as usize;
-    let scores: Vec<f32> = (0..=steps)
-        .map(|i| comb(candidate(i), 0.0) - comb(candidate(i), 0.5))
-        .collect();
+    let scores: Vec<f32> = (0..=steps).map(|i| comb(candidate(i))).collect();
     let (best, &score) = scores
         .iter()
         .enumerate()
         .max_by(|a, b| cmp_finite(*a.1, *b.1))?;
-    // Confidence from the periodicity alone: what falls between beats, like
-    // a rolling bassline, doesn't make the beat less clear.
-    if comb(candidate(best), 0.0) / (TEMPO_COMB_HARMONICS as f32 * acf[0]) < TEMPO_MIN_CONFIDENCE {
+    if score / (TEMPO_COMB_HARMONICS as f32 * acf[0]) < TEMPO_MIN_CONFIDENCE {
         return None;
     }
     // Parabolic refinement between grid steps.

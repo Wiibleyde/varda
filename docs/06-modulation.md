@@ -322,9 +322,9 @@ Beats are detected from the kick, with **spectral flux onset detection** over 30
 
 1. Compute the energy increase in the kick band each frame, relative to the band's recent level, so input gain doesn't matter. Input below -60 dBFS counts as silence.
 2. Compare it against an adaptive threshold (median of recent flux values).
-3. Reject double-triggers within 100 ms.
+3. Reject double-triggers within 50 ms.
 
-**BPM** comes from the autocorrelation of the last 8 s of onset strength, re-estimated every 0.5 s. A candidate tempo scores high when onsets repeat at its beat and not halfway between beats, so a rolling bassline's 16ths don't double the tempo. The result is halved or doubled into the **audio tempo range** (default 70–240 BPM), which you can change in the clock popover (see [Control Surfaces](07-control-surfaces.md#clock-preference)). A different tempo, such as a double, replaces the current one only after 3 agreeing estimates. BPM clears after 2 s of silence or without onsets.
+**BPM** comes from the autocorrelation of the last 8 s of onset strength, re-estimated every 0.5 s. The result is halved or doubled into the **audio tempo range** (default 70–240 BPM), which you can change in the clock popover (see [Control Surfaces](07-control-surfaces.md#clock-preference)). A different tempo, such as a double, replaces the current one only after 3 agreeing estimates. BPM clears after 2 s of silence or without onsets.
 
 **Beat phase** follows a beat grid at that tempo. Each beat, the strongest onset within half a beat of the predicted beat nudges the grid toward itself, so the grid locks to the kick rather than to bass notes between kicks. If the strongest onset is off the grid for 4 beats in a row, the grid snaps to it.
 

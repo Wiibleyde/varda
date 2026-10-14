@@ -202,7 +202,7 @@ The default is **Auto** (priority order). You can force a source:
 
 Click the **BPM display** in the top bar to open the clock preference popover. It lists every detected MIDI clock device with its current BPM.
 
-The popover also sets the **audio range**: the tempo range detected tempos are halved or doubled into. The default, 70–240 BPM, covers most music. Narrow it if detection lands on the double or half of your tempo, for example 120–240 for psytrance, darkpsy, or hitech, or 60–120 for half-time dub. The max is always at least twice the min, so every tempo has an octave in the range; the limits are 40–320 BPM.
+The **Audio detection** section of the popover sets the **range**: the tempo range detected tempos are halved or doubled into. It applies in every mode except Manual, since Auto, MIDI and OSC all fall back to audio when their clock goes stale, so it is greyed out only in Manual. The default, 70–240 BPM, covers most music. Narrow it if detection lands on the double or half of your tempo, for example 120–240 for psytrance, darkpsy, or hitech, or 60–120 for half-time dub. The max is always at least twice the min, so every tempo has an octave in the range; the limits are 40–320 BPM.
 
 ### What Uses the Clock
 

@@ -27,7 +27,7 @@ const ONSET_LATENCY_FRAMES: f64 = 0.25;
 /// Seconds after an onset over which its strength peaks, taken as its
 /// strength when picking each beat's strongest onset. Below
 /// [`MIN_ONSET_INTERVAL`], so peaks don't overlap.
-const ONSET_PEAK_SECS: f64 = 0.05;
+const ONSET_PEAK_SECS: f64 = 0.04;
 /// Seconds of onsets kept for the beat grid: more than a beat and a half at
 /// the slowest tempo.
 const ONSET_HISTORY_SECS: f64 = 3.0;
